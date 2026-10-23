@@ -128,6 +128,31 @@ export async function dbDelete(id) {
   });
 }
 
+// Replace the whole cache in ONE transaction (faster + atomic vs clear() then put()).
+export async function dbReplaceAll(links) {
+  const db = await openDB();
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const store = tx.objectStore(STORE_NAME);
+
+    store.clear();
+
+    for (const link of links) {
+      const normalized = normalizeLink(link);
+
+      if (normalized) {
+        store.put(normalized);
+      }
+    }
+
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () =>
+      reject(tx.error || new Error("IndexedDB transaction aborted"));
+  });
+}
+
 export async function dbClear() {
   const db = await openDB();
 
@@ -141,6 +166,30 @@ export async function dbClear() {
     tx.onabort = () =>
       reject(tx.error || new Error("IndexedDB transaction aborted"));
   });
+}
+
+// ----------------------------------------------------------------------------
+// Cache ownership: the IndexedDB cache belongs to ONE user. This stops another
+// account (or a logged-out visitor) from ever seeing someone else's cached links.
+// ----------------------------------------------------------------------------
+
+const CACHE_OWNER_KEY = "linkvault_cache_owner";
+
+export function getCacheOwner() {
+  try {
+    return localStorage.getItem(CACHE_OWNER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setCacheOwner(owner) {
+  try {
+    if (owner) localStorage.setItem(CACHE_OWNER_KEY, owner);
+    else localStorage.removeItem(CACHE_OWNER_KEY);
+  } catch {
+    /* storage unavailable */
+  }
 }
 
 // ============================================================================
@@ -172,12 +221,15 @@ async function apiRequest(url, options = {}) {
   return result;
 }
 
-export async function fetchLinksFromServer(token, apiUrl) {
+export async function fetchLinksFromServer(token, apiUrl, signal) {
   try {
     const headers = token ? { Authorization: `Bearer ${token}` } : {};
 
-    const data = await apiRequest(`${apiUrl}/links`, {
+    // Server default page size is 20; ask for the max (100) so users with more
+    // than 20 links see all of them.
+    const data = await apiRequest(`${apiUrl}/links?limit=100`, {
       headers,
+      signal,
     });
 
     return Array.isArray(data.links) ? data.links : [];

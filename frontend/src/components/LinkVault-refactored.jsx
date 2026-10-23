@@ -3,6 +3,7 @@ import { Toast, ConfirmDialog, LoginRequiredModal } from "./components";
 import { AddLinkModal, DetailsSidebar } from "./modal-components";
 import { LinkCardList, LinkCardGrid } from "./link-card";
 import { EmptyState, Header, FilterBar, CategoryTabs, LinkCountBar } from "./empty-and-header";
+import { LinkSkeletons, TopProgress } from "./Loaders";
 import {
   CATEGORIES,
   SORT_OPTIONS,
@@ -13,9 +14,11 @@ import {
 import {
   dbGetAll,
   dbPut,
-  dbPutMany,
+  dbReplaceAll,
   dbDelete,
   dbClear,
+  getCacheOwner,
+  setCacheOwner,
   fetchLinksFromServer,
   saveToServer,
   updateOnServer,
@@ -35,9 +38,15 @@ const API_BASE = `${import.meta.env.VITE_API_BASE || "http://localhost:4000"}/ap
 export default function LinkVault({ user, token, onLogin, apiUrl = API_BASE }) {
   const isAuthenticated = Boolean(user && token);
 
+  // Identifies whose links are in the local cache (see getCacheOwner).
+  const cacheOwner = isAuthenticated
+    ? String(user?.email || user?.name || "user").toLowerCase()
+    : null;
+
   // State: Links data
   const [links, setLinks] = useState([]);
-  const [loading, setLoading] = useState(true);
+  // Guests have nothing to load, so they never see the skeleton.
+  const [loading, setLoading] = useState(isAuthenticated);
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -91,58 +100,82 @@ export default function LinkVault({ user, token, onLogin, apiUrl = API_BASE }) {
   }, []);
 
   // ========================================================================
-  // Load links on mount or when token changes
+  // Load links: show the local cache INSTANTLY, then refresh from the server
+  // in the background (stale-while-revalidate).
   // ========================================================================
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
 
     async function load() {
+      // Guests have no links -> nothing to load, no pointless 401 request.
+      if (!token || !cacheOwner) {
+        setLinks([]);
+        setLoading(false);
+        setSyncing(false);
+        return;
+      }
+
       setLoading(true);
-      setSyncing(true);
+
+      // 1) Instant paint from the cache (only if it belongs to this user).
+      let hadCache = false;
 
       try {
-        // Try to fetch from server
-        const serverLinks = await fetchLinksFromServer(token, apiUrl);
+        if (getCacheOwner() === cacheOwner) {
+          const cached = (await dbGetAll()).map(normalizeLink).filter(Boolean);
+
+          if (cached.length && !cancelled) {
+            setLinks(cached);
+            setLoading(false);
+            hadCache = true;
+          }
+        } else {
+          // Cache is from someone else -> never show it.
+          await dbClear();
+          setCacheOwner(cacheOwner);
+        }
+      } catch (error) {
+        console.warn("Local cache read failed:", error);
+      }
+
+      // 2) Fresh data from the server (background when the cache was shown).
+      if (!cancelled) setSyncing(true);
+
+      try {
+        const serverLinks = await fetchLinksFromServer(
+          token,
+          apiUrl,
+          controller.signal,
+        );
+
+        if (cancelled) return;
 
         if (serverLinks) {
           const normalized = serverLinks.map(normalizeLink).filter(Boolean);
 
-          if (!cancelled) {
-            setLinks(normalized);
-          }
+          setLinks(normalized);
 
-          // Sync to local cache
           try {
-            await dbClear();
-            await dbPutMany(normalized);
+            await dbReplaceAll(normalized);
+            setCacheOwner(cacheOwner);
           } catch (error) {
             console.warn("Local cache sync failed:", error);
           }
-        } else {
-          // Fall back to local cache
-          const cached = await dbGetAll();
-
-          if (!cancelled) {
-            setLinks(cached.map(normalizeLink).filter(Boolean));
-          }
+        } else if (!hadCache) {
+          showToast("Could not reach the server.", "error");
         }
       } catch (error) {
         console.error("Load error:", error);
 
-        // Final fallback to cache
-        try {
-          const cached = await dbGetAll();
-
-          if (!cancelled) {
-            setLinks(cached.map(normalizeLink).filter(Boolean));
-          }
-        } catch {
-          if (!cancelled) {
-            showToast("Could not load your links.", "error");
-          }
+        if (!cancelled && !hadCache) {
+          showToast("Could not load your links.", "error");
         }
       } finally {
+        clearTimeout(timeout);
+
         if (!cancelled) {
           setLoading(false);
           setSyncing(false);
@@ -154,8 +187,10 @@ export default function LinkVault({ user, token, onLogin, apiUrl = API_BASE }) {
 
     return () => {
       cancelled = true;
+      clearTimeout(timeout);
+      controller.abort();
     };
-  }, [token, apiUrl, showToast]);
+  }, [token, cacheOwner, apiUrl, showToast]);
 
   // ========================================================================
   // Save new link
@@ -523,43 +558,13 @@ export default function LinkVault({ user, token, onLogin, apiUrl = API_BASE }) {
   }, [links, search, category, sort, onlyStarred]);
 
   // ========================================================================
-  // Loading state
-  // ========================================================================
-
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950">
-        <div className="text-center">
-          <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 flex items-center justify-center mx-auto mb-4 animate-pulse">
-            <svg
-              className="w-8 h-8 text-indigo-400"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.8}
-                d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"
-              />
-            </svg>
-          </div>
-
-          <p className="text-sm font-medium text-slate-400">
-            {syncing ? "Syncing your links..." : "Loading your links…"}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // ========================================================================
   // Main UI
   // ========================================================================
 
   return (
     <div className="min-h-screen bg-slate-950">
+      <TopProgress active={loading || syncing} />
+
       {/* Overlays and modals */}
       {toast && <Toast message={toast.message} type={toast.type} />}
 
@@ -674,7 +679,9 @@ export default function LinkVault({ user, token, onLogin, apiUrl = API_BASE }) {
         />
 
         {/* Links grid/list */}
-        {filteredLinks.length === 0 ? (
+        {loading ? (
+          <LinkSkeletons layout={layout} />
+        ) : filteredLinks.length === 0 ? (
           <EmptyState
             query={search}
             onAdd={() => {

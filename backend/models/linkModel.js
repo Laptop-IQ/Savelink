@@ -74,4 +74,8 @@ const linkSchema = new mongoose.Schema(
 );
 
 
+// "All links of this user, newest first" is THE hot query. This compound index
+// serves the filter AND the sort straight from the index (no in-memory sort).
+linkSchema.index({ userId: 1, savedAt: -1 });
+
 export default mongoose.model("Link", linkSchema);

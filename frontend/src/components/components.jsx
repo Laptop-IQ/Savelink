@@ -200,7 +200,7 @@ export function Favicon({ url, size = "normal" }) {
   const getFaviconUrl = (url) => {
     try {
       const domain = new URL(url).hostname.replace(/^www\./i, "");
-      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`;
+      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=${size === "large" ? 128 : 64}`;
     } catch {
       return "";
     }
@@ -216,6 +216,7 @@ export function Favicon({ url, size = "normal" }) {
           alt=""
           className="w-full h-full object-contain"
           loading="lazy"
+          decoding="async"
           referrerPolicy="no-referrer"
           onError={() => setFailed(true)}
         />

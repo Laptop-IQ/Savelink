@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import {
   Navigate,
   Route,
@@ -6,15 +6,19 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
-import axios from "axios";
 import Navbar from "./components/Navbar";
-
-
-import Login from "./Context/Login";
-import Signup from "./Context/Signup";
-import VerifyOtp from "./Context/VerifyOtp";
-import ForgotPassword from "./Context/ForgotPassword";
 import LinkVault from "./components/LinkVault-refactored";
+import { BrandLoader } from "./components/Loaders";
+import { dbClear, setCacheOwner } from "./components/db-and-api";
+
+// Auth pages are only needed when visited -> separate chunks keep the first
+// load small. (axios + these pages' icons now load only with them.)
+const loadLogin = () => import("./Context/Login");
+const loadSignup = () => import("./Context/Signup");
+const Login = lazy(loadLogin);
+const Signup = lazy(loadSignup);
+const VerifyOtp = lazy(() => import("./Context/VerifyOtp"));
+const ForgotPassword = lazy(() => import("./Context/ForgotPassword"));
 
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ||
@@ -136,36 +140,6 @@ function ScrollToTop() {
 }
 
 // --------------------------------------------------
-// Loading Screen
-// --------------------------------------------------
-
-function LoadingScreen() {
-  return (
-    <div
-      className="min-h-screen bg-[#0A0810] flex items-center justify-center"
-      role="status"
-      aria-live="polite"
-    >
-      <div className="flex flex-col items-center">
-        <div
-          className="
-            w-10
-            h-10
-            rounded-full
-            border-2
-            border-white/10
-            border-t-[#8B72FF]
-            animate-spin
-          "
-        />
-
-        <p className="mt-4 text-sm text-slate-500">Loading...</p>
-      </div>
-    </div>
-  );
-}
-
-// --------------------------------------------------
 // Public Only Route
 // --------------------------------------------------
 
@@ -196,9 +170,10 @@ function HomePage({ user, token, onLogout }) {
 
 
 export default function App() {
-  const [user, setUser] = useState(null);
-  const [token, setToken] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
+  // Restore the session synchronously from storage -> UI renders instantly.
+  // The token is verified in the background (see bootstrapAuth below).
+  const [user, setUser] = useState(() => getStoredAuth().user);
+  const [token, setToken] = useState(() => getStoredAuth().token);
 
 
   const persistAuth = useCallback((userData, tokenValue, remember = false) => {
@@ -245,6 +220,10 @@ export default function App() {
   const handleLogout = useCallback(() => {
     clearStoredAuth();
 
+    // Don't leave this user's links sitting in the browser cache.
+    dbClear().catch(() => {});
+    setCacheOwner(null);
+
     setUser(null);
     setToken(null);
   }, []);
@@ -254,97 +233,85 @@ export default function App() {
   // ------------------------------------------------
 
   useEffect(() => {
-    let mounted = true;
+    const storedAuth = getStoredAuth();
 
-    async function bootstrapAuth() {
-      const storedAuth = getStoredAuth();
-
-      // No stored token.
-      if (!storedAuth.token) {
-        if (!mounted) return;
-
-        setUser(null);
-        setToken(null);
-        setIsLoading(false);
-
-        return;
-      }
-
-      // Immediately restore stored auth.
-      if (mounted) {
-        setUser(storedAuth.user || null);
-        setToken(storedAuth.token);
-      }
-
-      // API is not configured.
-      if (!API_BASE) {
+    // Nothing to verify.
+    if (!storedAuth.token || !API_BASE) {
+      if (storedAuth.token && !API_BASE) {
         console.warn("[Auth] API base URL is not configured.");
-
-        if (mounted) {
-          setIsLoading(false);
-        }
-
-        return;
       }
+      return undefined;
+    }
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+
+    (async () => {
       try {
-        const response = await axios.get(`${API_USER_URL}/me`, {
-          headers: {
-            Authorization: `Bearer ${storedAuth.token}`,
-          },
-
-          timeout: 10000,
-
-          params: {
-            _t: Date.now(),
-          },
+        const response = await fetch(`${API_USER_URL}/me`, {
+          headers: { Authorization: `Bearer ${storedAuth.token}` },
+          cache: "no-store",
+          signal: controller.signal,
         });
 
-        if (!mounted) return;
+        if (response.status === 401 || response.status === 403) {
+          // Only real authorization failures log the user out.
+          clearStoredAuth();
+          dbClear().catch(() => {});
+          setCacheOwner(null);
+          setUser(null);
+          setToken(null);
+          return;
+        }
 
-        const profile = response?.data;
+        if (!response.ok) {
+          throw new Error(`Profile request failed (${response.status})`);
+        }
+
+        const body = await response.json();
+
+        // API replies { success, user } -> unwrap (older shape: the user itself).
+        const profile = body?.user || body;
 
         if (!profile) {
           throw new Error("Invalid user profile received from server.");
         }
 
-        // Refresh user information while keeping
-        // the existing token and storage preference.
+        // Refresh user info, keep the existing token + storage preference.
         persistAuth(profile, storedAuth.token, storedAuth.persistent);
       } catch (error) {
-        const status = error?.response?.status;
-
-        console.warn(
-          "[Auth] Token validation failed:",
-          status || error?.message,
-        );
-
-        /*
-         * Only clear authentication for actual
-         * authorization failures.
-         *
-         * Network/server errors won't immediately
-         * log the user out.
-         */
-        if (mounted && (status === 401 || status === 403)) {
-          clearStoredAuth();
-
-          setUser(null);
-          setToken(null);
+        // Network/server errors never log the user out.
+        if (error?.name !== "AbortError") {
+          console.warn("[Auth] Token validation failed:", error?.message);
         }
       } finally {
-        if (mounted) {
-          setIsLoading(false);
-        }
+        clearTimeout(timer);
       }
-    }
-
-    bootstrapAuth();
+    })();
 
     return () => {
-      mounted = false;
+      clearTimeout(timer);
+      controller.abort();
     };
   }, [persistAuth]);
+
+  // Warm up the auth pages while the browser is idle so Login/Signup open instantly.
+  useEffect(() => {
+    if (token) return undefined;
+
+    const warm = () => {
+      loadLogin();
+      loadSignup();
+    };
+
+    if ("requestIdleCallback" in window) {
+      const id = window.requestIdleCallback(warm, { timeout: 3000 });
+      return () => window.cancelIdleCallback(id);
+    }
+
+    const id = setTimeout(warm, 1500);
+    return () => clearTimeout(id);
+  }, [token]);
 
   // ------------------------------------------------
   // Login
@@ -385,14 +352,6 @@ export default function App() {
   );
 
   // ------------------------------------------------
-  // Initial Loading
-  // ------------------------------------------------
-
-  if (isLoading) {
-    return <LoadingScreen />;
-  }
-
-  // ------------------------------------------------
   // Routes
   // ------------------------------------------------
 
@@ -401,6 +360,7 @@ export default function App() {
       <ScrollToTop />
       <Navbar user={user} onLogout={handleLogout} />
       <main className="pt-16">
+        <Suspense fallback={<BrandLoader inline message="Loading…" />}>
         <Routes>
           {/* Home */}
           <Route
@@ -448,6 +408,7 @@ export default function App() {
           {/* Unknown Route */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+        </Suspense>
       </main>
     </>
   );

@@ -19,8 +19,9 @@ export default async function authMiddleware(req, res, next) {
     // Token verify karo
     const payload = jwt.verify(token, JWT_SECRET);
 
-    // User fetch karo DB se
-    const user = await User.findById(payload.id).select("-password");
+    // Only check that the user still exists: fetch just the _id (lean, no
+    // password hash, no full mongoose document) -> much lighter per request.
+    const user = await User.findById(payload.id).select("_id").lean();
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -28,8 +29,8 @@ export default async function authMiddleware(req, res, next) {
       });
     }
 
-    // User ko req object me attach karo
-    req.user = user;
+    // Controllers only need the id (req.user.id / req.user._id).
+    req.user = { id: String(user._id), _id: user._id };
     next();
   } catch (err) {
     console.error("JWT verification failed:", err);
